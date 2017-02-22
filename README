@@ -1,0 +1,21 @@
+python redis bloom filter based on [pybloom](https://github.com/jaybaird/python-bloomfilter)
+
+
+USAGE:
+```
+>>> b = RedisBloomFilter(server=server, bfkeypreffix="atest:bf", capacity=100000, error_rate=0.001)
+>>> b.add("test")
+False
+>>> "test" in b
+True
+```
+
+```
+>>> b = ScalableRedisBloomFilter(server=server, bfkeypreffix="satest:bf", initial_capacity=512, error_rate=0.001, \
+        max_filters = 5,
+        mode=ScalableRedisBloomFilter.SMALL_SET_GROWTH)
+>>> b.add("hello")
+False
+>>> "hello" in b
+True
+```
