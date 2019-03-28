@@ -57,7 +57,11 @@ def make_hashfuncs(num_slices, num_bits):
 
 
 class RedisBloomFilter(object):
-    SLICE_KEY_FMT = "%s:%s"
+    REDIS_BF_SLICE_KEY_FMT = "%s:bf:s:%s"
+    REDIS_BF_META_HASH_KEY = "%s:bf:meta"
+    REDIS_BF_HASH_FIELD_CONF = "conf"
+    REDIS_BF_HASH_FIELD_COUNT = "count"
+    REDIS_CNF_FMT = b'<dQQQ'
 
     def __init__(self, server, bfkeypreffix, capacity, error_rate=0.001):
         """Implements a space-efficient probabilistic data structure
@@ -96,20 +100,38 @@ class RedisBloomFilter(object):
             (capacity * abs(math.log(error_rate))) /
             (num_slices * (math.log(2) ** 2))))
         if bits_per_slice > MAX_PER_SLICE_SIZE:
-            raise ValueError("Capacity and error_rate make per slice size extended, MAX_PER_SLICE_SIZE is %s" % (MAX_PER_SLICE_SIZE))
-        self._setup(error_rate, num_slices, bits_per_slice, capacity, 0, server, bfkeypreffix)
+            raise ValueError("Capacity[%s] and error_rate[%s] make per slice size extended, MAX_PER_SLICE_SIZE is %s, now is %s" % (capacity, error_rate, MAX_PER_SLICE_SIZE, bits_per_slice))
+        self._setup(error_rate, num_slices, bits_per_slice, capacity, server, bfkeypreffix)
 
-    def _setup(self, error_rate, num_slices, bits_per_slice, capacity, count, server, bfkeypreffix):
+    def _setup(self, error_rate, num_slices, bits_per_slice, capacity, server, bfkeypreffix):
         self.error_rate = error_rate
         self.num_slices = num_slices
         self.bits_per_slice = bits_per_slice
         self.capacity = capacity
         self.num_bits = num_slices * bits_per_slice
-        self.count = count
         self.make_hashes = make_hashfuncs(self.num_slices, self.bits_per_slice)
         self.bfkeypreffix = bfkeypreffix
         self.server = server
-        self.sliceKeys = tuple(self.SLICE_KEY_FMT % (self.bfkeypreffix, i) for i in range(num_slices))
+        self.sliceKeys = tuple(self.REDIS_BF_SLICE_KEY_FMT % (self.bfkeypreffix, i) for i in range(num_slices))
+        self.bfMetaKey = self.REDIS_BF_META_HASH_KEY % self.bfkeypreffix
+        self._checkExists()
+        
+
+    def _checkExists(self):
+        existsCnf = self.server.hget(self.bfMetaKey, self.REDIS_BF_HASH_FIELD_CONF)
+        if not existsCnf:
+            self.server.hset(self.bfMetaKey, self.REDIS_BF_HASH_FIELD_CONF, pack(self.REDIS_CNF_FMT, self.error_rate, self.num_slices,
+                     self.bits_per_slice, self.capacity))
+            pipe = self.server.pipeline(transaction=True)
+            for key in self.sliceKeys:
+                pipe.delete(key)
+            pipe.hset(self.bfMetaKey, self.REDIS_BF_HASH_FIELD_COUNT, 0)
+            pipe.execute()
+        else:
+            error_rate, num_slices, bits_per_slice, capacity = unpack(self.REDIS_CNF_FMT, existsCnf)
+            if self.error_rate != error_rate or self.num_slices != num_slices or self.bits_per_slice != bits_per_slice or self.capacity != capacity:
+                raise ValueError("setup configure not match exists")
+
 
     def __contains__(self, key):
         """Tests a key's membership in this bloom filter.
@@ -121,12 +143,11 @@ class RedisBloomFilter(object):
         True
 
         """
-        bits_per_slice = self.bits_per_slice
         hashes = self.make_hashes(key)
         pipe = self.server.pipeline(transaction=False) 
         sliceIdx = 0
         for k in hashes:
-            sliceKey = self.SLICE_KEY_FMT % (self.bfkeypreffix, sliceIdx)
+            sliceKey = self.REDIS_BF_SLICE_KEY_FMT % (self.bfkeypreffix, sliceIdx)
             pipe.getbit(sliceKey, k)
             sliceIdx += 1
         getbits = pipe.execute()  
@@ -137,7 +158,14 @@ class RedisBloomFilter(object):
 
     def __len__(self):
         """Return the number of keys stored by this bloom filter."""
-        return self.count
+        count = self.server.hget(self.bfMetaKey, self.REDIS_BF_HASH_FIELD_COUNT)
+        if count:
+            return int(count)
+        return 0
+
+    @property
+    def count(self):
+        return len(self)
 
     def add(self, key, skip_check=False):
         """ Adds a key to this bloom filter. If the key already exists in this
@@ -148,19 +176,19 @@ class RedisBloomFilter(object):
         False
         >>> b.add("hello")
         True
-        >>> b.count
+        >>> len(b)
         1
 
         """
-        bits_per_slice = self.bits_per_slice
         hashes = self.make_hashes(key)
         found_all_bits = True
-        if self.count > self.capacity:
+        if len(self) >= self.capacity:
             raise IndexError("RedisBloomFilter is at capacity")
+        # TODO, check and increase not async
         pipe = self.server.pipeline(transaction=False) 
         sliceIdx = 0
         for k in hashes:
-            sliceKey = self.SLICE_KEY_FMT % (self.bfkeypreffix, sliceIdx)
+            sliceKey = self.REDIS_BF_SLICE_KEY_FMT % (self.bfkeypreffix, sliceIdx)
             pipe.setbit(sliceKey, k, 1)
             sliceIdx += 1
         pipeResults = pipe.execute()
@@ -170,17 +198,21 @@ class RedisBloomFilter(object):
                     found_all_bits = False
                     break
         if skip_check:
-            self.count += 1
+            self.server.hincrby(self.bfMetaKey, self.REDIS_BF_HASH_FIELD_COUNT, 1)
             return False
         elif not found_all_bits:
-            self.count += 1
+            self.server.hincrby(self.bfMetaKey, self.REDIS_BF_HASH_FIELD_COUNT, 1)
             return False
         else:
             return True
 
     def clear(self):
+        pipe = self.server.pipeline(transaction=True)
+        pipe.delete(self.bfMetaKey)
         for key in self.sliceKeys:
-            self.server.delete(key)
+            pipe.delete(key)
+        pipe.execute()
+        del self.sliceKeys[:]
 
     def copy(self):
         """Return a copy of this bloom filter.
@@ -234,7 +266,14 @@ have equal capacity and error rate")
 class ScalableRedisBloomFilter(object):
     SMALL_SET_GROWTH = 2 # slower, but takes up less memory
     LARGE_SET_GROWTH = 4 # faster, but takes up more memory faster
-    FILTER_KEY_FMT = '%s:f%s'
+    REDIS_SBF_FILTERS_KEY_FMT = '%s:sbf:fs'
+    REDIS_EACH_FILTER_KEY_FMT = '%s:sbf:f:%s'
+    REDIS_SBF_META_HASH_KEY = "%s:sbf:meta"
+    REDIS_SBF_META_CONF_HASH_FIELD = "conf"
+    # REDIS_SBF_META_COUNT_HASH_FIELD = "count"
+    REDIS_SBF_META_FILTER_IDX_HASH_FIELD = "f-id"
+    REDIS_SBF_META_FILTERS_LOCK_HASH_FIELD = "lock"
+    REDIS_CNF_FMT = '<idQddi'
 
     def __init__(self, server, bfkeypreffix, initial_capacity=100, error_rate=0.001,
                  max_filters = -1,
@@ -277,17 +316,41 @@ class ScalableRedisBloomFilter(object):
         if not error_rate or error_rate < 0:
             raise ValueError("Error_Rate must be a decimal less than 0.")
         self._setup(mode, 0.9, initial_capacity, error_rate, server, bfkeypreffix, max_filters)
-        self.filters = []
 
     def _setup(self, mode, ratio, initial_capacity, error_rate, server, bfkeypreffix, max_filters):
         self.scale = mode
         self.ratio = ratio
         self.initial_capacity = initial_capacity
         self.error_rate = error_rate
+        self.filterErrorRate = self.error_rate * (1.0 - self.ratio)
+        num_slices = int(math.ceil(math.log(1.0 / self.filterErrorRate, 2)))
+        self.MAX_FILTER_CAPACITY = int(math.floor(MAX_PER_SLICE_SIZE * (num_slices * (math.log(2) ** 2)) / abs(math.log(self.filterErrorRate))))
+        print "MAX FILTER Capacity", self.MAX_FILTER_CAPACITY
         self.server = server
         self.bfkeypreffix = bfkeypreffix
-        self.filter_count = 0
         self.max_filters = max_filters
+        self.sbfMetaKey = self.REDIS_SBF_META_HASH_KEY % self.bfkeypreffix
+        self.sbfFilterKeys = self.REDIS_SBF_FILTERS_KEY_FMT % (self.bfkeypreffix)
+        self._checkExists()
+        self.filtersMap = {}
+
+    def _checkExists(self):
+        existsCnf = self.server.hget(self.sbfMetaKey, self.REDIS_SBF_META_CONF_HASH_FIELD)
+        if not existsCnf:
+            self.server.hset(self.sbfMetaKey, self.REDIS_SBF_META_CONF_HASH_FIELD, pack(self.REDIS_CNF_FMT, self.scale, self.ratio,
+                     self.initial_capacity, self.error_rate, self.filterErrorRate, self.max_filters))
+            filterKeys = self.server.lrange(self.sbfFilterKeys, 0, -1)
+            pipe = self.server.pipeline(transaction=True)
+            for key in filterKeys:
+                pipe.delete(key)
+            # pipe.hset(self.sbfMetaKey, self.REDIS_SBF_META_COUNT_HASH_FIELD, 0)
+            pipe.delete(self.sbfFilterKeys)
+            pipe.execute()
+        else:
+            scale, ratio, initial_capacity, error_rate, filterErrorRate, max_filters = unpack(self.REDIS_CNF_FMT, existsCnf)
+            if (self.scale, self.ratio, self.initial_capacity, self.error_rate, self.filterErrorRate, self.max_filters) != (scale, ratio, initial_capacity, error_rate, filterErrorRate, max_filters):
+                raise ValueError("setup configure not match exists")
+            
 
     def __contains__(self, key):
         """Tests a key's membership in this bloom filter.
@@ -301,10 +364,83 @@ class ScalableRedisBloomFilter(object):
         True
 
         """
-        for f in reversed(self.filters):
-            if key in f:
+        filterKeys = self._make_sure_filters()
+        for filterKey in filterKeys: # reversed filters by create time 
+            if key in self.filtersMap[filterKey]:
                 return True
         return False
+
+    def _split_filter_key(self, filterKey):
+        filterKeyPrefix, capacity = filterKey.rsplit("||", 1)
+        return filterKeyPrefix, capacity
+
+    def _build_filter_key(self, filterKeyPrefix, capacity):
+        return "%s||%s" % (filterKeyPrefix, capacity)
+
+    def _make_sure_filters(self):
+        filterKeys = self.server.lrange(self.sbfFilterKeys, 0, self.max_filters-1 if self.max_filters > 0 else -1)
+        newFiltersMap = {}
+        for filterKey in filterKeys:
+            f = self.filtersMap.get(filterKey, None)
+            if f is None:
+                filterKeyPrefix, capacity = self._split_filter_key(filterKey)
+                f = RedisBloomFilter(server=self.server, bfkeypreffix=filterKeyPrefix, capacity=int(capacity), error_rate=self.filterErrorRate)
+            newFiltersMap[filterKey] = f
+        self.filtersMap = newFiltersMap
+        return filterKeys
+
+    def create_filter(self):
+        if self._try_get_lock():
+            try:
+                capacity = self.initial_capacity
+                lastFilterKey = self.server.lrange(self.sbfFilterKeys, 0, 0)
+                if lastFilterKey:
+                    _, lastCapacity = self._split_filter_key(lastFilterKey[0])
+                    capacity = int(lastCapacity) * self.scale
+                    if capacity > self.MAX_FILTER_CAPACITY:
+                        capacity = self.MAX_FILTER_CAPACITY
+                filterIdx = self.server.hincrby(self.sbfMetaKey, self.REDIS_SBF_META_FILTER_IDX_HASH_FIELD, 1)
+                filterKeyPrefix = self.REDIS_EACH_FILTER_KEY_FMT % (self.bfkeypreffix, filterIdx)
+                filterKey = self._build_filter_key(filterKeyPrefix, capacity)
+                self.server.lpush(self.sbfFilterKeys, filterKey)
+                f = RedisBloomFilter(
+                    server=self.server, 
+                    bfkeypreffix = filterKeyPrefix,
+                    capacity=capacity,
+                    error_rate=self.filterErrorRate)
+                self.filtersMap[filterKey] = f
+                badFilterKeys = self.server.lrange(self.sbfFilterKeys, self.max_filters, -1)
+                self.server.ltrim(self.sbfFilterKeys, 0, self.max_filters-1)
+                if badFilterKeys:
+                    self._delete_filters(badFilterKeys)
+                return f
+            except Exception,e:
+                print e
+                return None
+            finally:
+                self._release_lock()
+        else:
+            return None
+
+
+    def _delete_filters(self, filterKeys):
+        for filterKey in filterKeys:
+            self._delete_filter(filterKey)
+
+    def _delete_filter(self, filterKey):
+        filterKeyPrefix, capacity = self._split_filter_key(filterKey)
+        f = self.filtersMap.pop(filterKey, RedisBloomFilter(
+                server=self.server, 
+                bfkeypreffix = filterKeyPrefix,
+                capacity=capacity,
+                error_rate=self.filterErrorRate))
+        f.clear()
+
+    def _try_get_lock(self):
+        return self.server.hsetnx(self.sbfMetaKey, self.REDIS_SBF_META_FILTERS_LOCK_HASH_FIELD, 1)
+
+    def _release_lock(self):
+        self.server.hdel(self.sbfMetaKey, self.REDIS_SBF_META_FILTERS_LOCK_HASH_FIELD)
 
     def add(self, key):
         """Adds a key to this bloom filter.
@@ -322,47 +458,41 @@ class ScalableRedisBloomFilter(object):
         """
         if key in self:
             return True
-        if not self.filters:
-            filter = RedisBloomFilter(
-                server=self.server, 
-                bfkeypreffix = self.FILTER_KEY_FMT % (self.bfkeypreffix, self.filter_count),
-                capacity=self.initial_capacity,
-                error_rate=self.error_rate * (1.0 - self.ratio))
-            self.filter_count += 1
-            self.filters.append(filter)
-        else:
-            filter = self.filters[-1]
-            if filter.count >= filter.capacity:
-                capacity = filter.capacity * self.scale
-                if capacity > MAX_PER_SLICE_SIZE:
-                    capacity = MAX_PER_SLICE_SIZE
-                filter = RedisBloomFilter(
-                    server=self.server,
-                    bfkeypreffix = self.FILTER_KEY_FMT % (self.bfkeypreffix, self.filter_count),
-                    capacity=capacity,
-                    error_rate=self.error_rate * (1.0 - self.ratio))
-                self.filter_count += 1
-                self.filters.append(filter)
-                if self.max_filters > 0 and len(self.filters) >= self.max_filters:
-                    f = self.filters[0]
-                    f.clear()
-                    del self.filters[0]
-        filter.add(key, skip_check=True)
+        filterKeys = self._make_sure_filters()
+        lastFilter = None
+        if filterKeys:
+            lastFilter = self.filtersMap.get(filterKeys[0], None)
+        if lastFilter is None or lastFilter.capacity <= lastFilter.count:
+            lastFilter = self.create_filter()
+            while lastFilter is None:
+                filterKeys = self._make_sure_filters()
+                if filterKeys:
+                    lastFilter = self.filtersMap.get(filterKeys[0], None)
+                if lastFilter is None or lastFilter.capacity <= lastFilter.count:
+                    lastFilter = self.create_filter()
+        lastFilter.add(key, skip_check=True)
         return False
+
 
     @property
     def capacity(self):
         """Returns the total capacity for all filters in this SBF"""
-        return sum(f.capacity for f in self.filters)
+        self._make_sure_filters()
+        return sum(f.capacity for f in self.filtersMap.values())
 
     @property
     def count(self):
         return len(self)
 
-    def clear(self):
-        for f in self.filters:
-            f.clear()
-        del self.filters[:]
+    def clear(self): 
+        pipe = self.server.pipeline(transaction=True)
+        pipe.delete(self.sbfMetaKey)
+        pipe.lrange(self.sbfFilterKeys, 0, -1)
+        pipe.delete(self.sbfFilterKeys)
+        _,filterKeys,_,_ = pipe.execute()
+        if filterKeys:
+            self._delete_filters(filterKeys)
+        
 
     def tofile(self, f):
         """Serialize this ScalableBloomFilter into the file-object
@@ -376,4 +506,5 @@ class ScalableRedisBloomFilter(object):
 
     def __len__(self):
         """Returns the total number of elements stored in this SBF"""
-        return sum(f.count for f in self.filters)
+        self._make_sure_filters()
+        return sum(f.count for f in self.filtersMap.values())

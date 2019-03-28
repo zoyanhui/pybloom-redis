@@ -11,9 +11,6 @@ from redis import StrictRedis
 def main(capacity=100000, request_error_rate=0.001):
     server = StrictRedis.from_url("redis://192.168.254.106:6379")
     bfkeypreffix="test-bf"
-    keys = server.keys(bfkeypreffix + "*")
-    for key in keys:
-        server.delete(key)
     f = RedisBloomFilter(capacity=capacity, server=server, bfkeypreffix=bfkeypreffix, error_rate=request_error_rate)
     assert (capacity == f.capacity)
     start = time.time()
@@ -22,7 +19,7 @@ def main(capacity=100000, request_error_rate=0.001):
     end = time.time()
     print("{:5.3f} seconds to add to capacity, {:10.2f} entries/second".format(
             end - start, f.capacity / (end - start)))
-    keys = server.keys(bfkeypreffix + "*")
+    keys = server.keys("%s:s:%s" % (bfkeypreffix, "*"))
     oneBits = 0
     for key in keys:
         oneBits += server.bitcount(key)
@@ -55,10 +52,7 @@ def main(capacity=100000, request_error_rate=0.001):
 
 def mainScalable(capacity=100000, request_error_rate=0.001):
     server = StrictRedis.from_url("redis://192.168.254.106:6379")
-    bfkeypreffix="test-bf"
-    keys = server.keys(bfkeypreffix + "*")
-    for key in keys:
-        server.delete(key)
+    bfkeypreffix="test-sbf"
     f = ScalableRedisBloomFilter(initial_capacity=10000, server=server, bfkeypreffix=bfkeypreffix, error_rate=request_error_rate, max_filters=5)
     # assert (capacity == f.capacity)
     start = time.time()
@@ -67,17 +61,21 @@ def mainScalable(capacity=100000, request_error_rate=0.001):
     end = time.time()
     print("{:5.3f} seconds to add to capacity, {:10.2f} entries/second".format(
             end - start, f.capacity / (end - start)))
-    keys = server.keys(bfkeypreffix + "*")
     oneBits = 0
-    for key in keys:
-        oneBits += server.bitcount(key)
+    filterKeys = server.lrange('%s:fs' % bfkeypreffix, 0, -1)
+    for filterKey in filterKeys:
+        filterKey, _ = filterKey.rsplit("||", 1)
+        keys = server.keys("%s:s:%s" % (filterKey, "*"))
+        for key in keys:
+            oneBits += server.bitcount(key)
     #print "Number of 1 bits:", oneBits
-    print("Number of Filter Bits:", sum(ff.num_bits for ff in f.filters))
-    print("Number of slices:", sum(ff.num_slices for ff in f.filters))
-    print("Bits per slice:", sum(ff.bits_per_slice for ff in f.filters))
+    print("Number of Filter Bits:", sum(ff.num_bits for ff in f.filtersMap.values()))
+    print("Number of slices:", sum(ff.num_slices for ff in f.filtersMap.values()))
+    print("Bits per slice:", sum(ff.bits_per_slice for ff in f.filtersMap.values()))
     print("------")
     print("Fraction of 1 bits at capacity: {:5.3f}".format(
-            oneBits / float(sum(ff.num_bits for ff in f.filters))))
+            oneBits / float(sum(ff.num_bits for ff in f.filtersMap.values()))))
+    
     # Look for false positives and measure the actual fp rate
     trials = f.capacity
     fp = 0
@@ -100,5 +98,5 @@ def mainScalable(capacity=100000, request_error_rate=0.001):
 
 
 if __name__ == '__main__' :
-    main()
+    # main()
     mainScalable()
